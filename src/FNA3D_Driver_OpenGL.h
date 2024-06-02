@@ -200,6 +200,17 @@ typedef unsigned char	GLboolean;
 #define GL_COMPRESSED_RGBA_BPTC_UNORM_EXT		0x8E8C
 #define GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM_EXT		0x8E8D
 
+/* Shaders & Programs */
+#define GL_CURRENT_PROGRAM                0x8B8D
+#define GL_FRAGMENT_SHADER                0x8B30
+#define GL_VERTEX_SHADER                  0x8B31
+#define GL_COMPILE_STATUS                 0x8B81
+#define GL_LINK_STATUS                    0x8B82
+
+/* glGetFramebufferAttachmentParameteriv */
+#define GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE 0x8CD0
+#define GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME 0x8CD1
+
 /* EXT_framebuffer_sRGB */
 #define GL_FRAMEBUFFER_SRGB_EXT				0x8DB9
 #define GL_FRAMEBUFFER_SRGB_CAPABLE_EXT			0x8DBA
