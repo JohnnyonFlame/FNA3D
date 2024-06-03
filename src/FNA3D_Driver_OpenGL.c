@@ -318,9 +318,14 @@ typedef struct OpenGLRenderer /* Cast from FNA3D_Renderer* */
 	OpenGLQuery *disposeQueries;
 	SDL_Mutex *disposeQueriesLock;
 
-	/* Shaders for BlitBuffer emulation. */
-	GLuint blitBufferProg;
-	GLuint blitBufferVAO, blitBufferVBO;
+	/* Resources for faux backbuffer. */
+	struct {
+		FNA3D_Effect *effect;
+		MOJOSHADER_effect *effectData;
+		FNA3D_Buffer *vertBuffer;
+		MOJOSHADER_effectStateChanges stateChanges;
+		FNA3D_VertexBufferBinding bindings;
+	} fauxBackbufferResources;
 
 	/* GL entry points */
 	glfntype_glGetString glGetString; /* Loaded early! */
@@ -1319,63 +1324,13 @@ static inline void DisposeResources(OpenGLRenderer *renderer)
 	#undef DISPOSE
 }
 
-static void BlitFramebuffer(
+static void BlitFauxbackbuffer(
 	FNA3D_Renderer *driverData,
 	GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
 	GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1,
+	GLint drawW, GLint drawH,
 	GLbitfield mask, GLenum filter
-) {
-	OpenGLRenderer *renderer = (OpenGLRenderer*) driverData;
-
-	/*
-	 * If we have glBlitFramebuffer, we can just use it, otherwise
-	 * we are forced to do this whole song and dance to emulate the
-	 * behavior.
-	 */
-	if (renderer->supports_EXT_framebuffer_blit)
-	{
-		renderer->glBlitFramebuffer(
-			srcX0, srcY0, srcX1, srcY1,
-			dstX0, dstY0, dstX1, dstY1,
-			mask, filter
-		);
-	}
-	else
-	{
-		GLint prog = 0;
-		renderer->glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
-
-		// Setup viewport
-		renderer->glUseProgram(renderer->blitBufferProg);
-		renderer->glActiveTexture(GL_TEXTURE0);
-		renderer->glBindTexture(GL_TEXTURE_2D, renderer->backbuffer->opengl.texture);
-		if (renderer->backbuffer->opengl.filter != filter)
-		{
-			renderer->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
-			renderer->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
-			renderer->backbuffer->opengl.filter = filter;
-		}
-		renderer->glViewport(dstX0, dstY0, dstX1 - dstX0, dstY1 - dstY0);
-		renderer->glScissor(dstX0, dstY0, dstX1 - dstX0, dstY1 - dstY0);
-		renderer->glBindVertexArray(renderer->blitBufferVAO);
-		renderer->glBindBuffer(GL_ARRAY_BUFFER, renderer->blitBufferVBO);
-		renderer->glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
-		// Reset changed states
-		renderer->glUseProgram(prog);
-		renderer->glBindTexture(renderer->textures[0]->target, renderer->textures[0]->handle);
-		renderer->glViewport(
-			renderer->viewport.x, renderer->viewport.y,
-			renderer->viewport.w, renderer->viewport.h
-		);
-		renderer->glScissor(
-			renderer->scissorRect.x, renderer->scissorRect.y,
-			renderer->scissorRect.w, renderer->scissorRect.h
-		);
-		renderer->glBindVertexArray(renderer->vao);
-		renderer->glBindBuffer(GL_ARRAY_BUFFER, renderer->currentVertexBuffer);
-	}
-}
+);
 
 static void OPENGL_SwapBuffers(
 	FNA3D_Renderer *driverData,
@@ -1385,6 +1340,7 @@ static void OPENGL_SwapBuffers(
 ) {
 	int32_t srcX, srcY, srcW, srcH;
 	int32_t dstX, dstY, dstW, dstH;
+	int32_t drawW, drawH;
 	OpenGLRenderer *renderer = (OpenGLRenderer*) driverData;
 
 	/* Only the faux-backbuffer supports presenting
@@ -1393,6 +1349,12 @@ static void OPENGL_SwapBuffers(
 	 */
 	if (renderer->backbuffer->type == BACKBUFFER_TYPE_OPENGL)
 	{
+		SDL_GetWindowSizeInPixels(
+			(SDL_Window*) overrideWindowHandle,
+			&drawW,
+			&drawH
+		);
+
 		if (sourceRectangle != NULL)
 		{
 			srcX = sourceRectangle->x;
@@ -1418,11 +1380,8 @@ static void OPENGL_SwapBuffers(
 		{
 			dstX = 0;
 			dstY = 0;
-			SDL_GetWindowSizeInPixels(
-				(SDL_Window*) overrideWindowHandle,
-				&dstW,
-				&dstH
-			);
+			dstW = drawW;
+			dstH = drawH;
 		}
 
 		if (renderer->scissorTestEnable)
@@ -1467,10 +1426,11 @@ static void OPENGL_SwapBuffers(
 				0
 			);
 			BindReadFramebuffer(renderer, renderer->backbuffer->opengl.handle);
-			BlitFramebuffer(
+			BlitFauxbackbuffer(
 				driverData,
 				0, 0, renderer->backbuffer->width, renderer->backbuffer->height,
 				0, 0, renderer->backbuffer->width, renderer->backbuffer->height,
+				drawW, drawH,
 				GL_COLOR_BUFFER_BIT,
 				GL_LINEAR
 			);
@@ -1491,10 +1451,11 @@ static void OPENGL_SwapBuffers(
 		}
 		BindDrawFramebuffer(renderer, renderer->realBackbufferFBO);
 
-		BlitFramebuffer(
+		BlitFauxbackbuffer(
 			driverData,
 			srcX, srcY, srcW, srcH,
 			dstX, dstY, dstW, dstH,
+			drawW, drawH,
 			GL_COLOR_BUFFER_BIT,
 			renderer->backbufferScaleMode
 		);
@@ -1712,14 +1673,14 @@ static void OPENGL_DrawIndexedPrimitives(
 	/* Draw! */
 	DrawRangeElementsBaseVertex(
 		renderer,
-			XNAToGL_Primitive[primitiveType],
-			minVertexIndex,
-			minVertexIndex + numVertices - 1,
-			PrimitiveVerts(primitiveType, primitiveCount),
-			XNAToGL_IndexType[indexElementSize],
-			(void*) (size_t) (startIndex * IndexSize(indexElementSize)),
-			baseVertex
-		);
+		XNAToGL_Primitive[primitiveType],
+		minVertexIndex,
+		minVertexIndex + numVertices - 1,
+		PrimitiveVerts(primitiveType, primitiveCount),
+		XNAToGL_IndexType[indexElementSize],
+		(void*) (size_t) (startIndex * IndexSize(indexElementSize)),
+		baseVertex
+	);
 
 	if (tps)
 	{
@@ -2938,10 +2899,11 @@ static void OPENGL_ResolveTarget(
 			renderer->glDisable(GL_SCISSOR_TEST);
 		}
 		BindDrawFramebuffer(renderer, renderer->resolveFramebufferDraw);
-		BlitFramebuffer(
+		BlitFauxbackbuffer(
 			driverData,
 			0, 0, width, height,
 			0, 0, width, height,
+			width, height,
 			GL_COLOR_BUFFER_BIT,
 			GL_LINEAR
 		);
@@ -3008,8 +2970,8 @@ static void OPENGL_INTERNAL_CreateBackbufferColorStorage(
 	}
 	else
 	{
-		/* If we're emulating the BlitFramebuffer, we need to always have a texture
-		 * attached, lest we can't draw it.
+		/* If we're emulating the faux backbuffer blit, we need to always have a
+		 * texture attached, lest we can't draw it.
 		 */
 		renderer->glGenTextures(1, &renderer->backbuffer->opengl.texture);
 		renderer->glBindTexture(GL_TEXTURE_2D, renderer->backbuffer->opengl.texture);
@@ -3545,10 +3507,11 @@ static void OPENGL_ReadBackbuffer(
 			0
 		);
 		BindReadFramebuffer(renderer, renderer->backbuffer->opengl.handle);
-		BlitFramebuffer(
+		BlitFauxbackbuffer(
 			driverData,
 			0, 0, renderer->backbuffer->width, renderer->backbuffer->height,
 			0, 0, renderer->backbuffer->width, renderer->backbuffer->height,
+			renderer->backbuffer->width, renderer->backbuffer->height,
 			GL_COLOR_BUFFER_BIT,
 			GL_LINEAR
 		);
@@ -6007,25 +5970,84 @@ static uint8_t OPENGL_PrepareWindowAttributes(uint32_t *flags)
 	return 1;
 }
 
-static GLuint LoadShader(
-	OpenGLRenderer *renderer,
-	GLenum type,
-	const char* shaderSrc
+static void BlitFauxbackbuffer(
+	FNA3D_Renderer *driverData,
+	GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
+	GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1,
+	GLint drawW, GLint drawH,
+	GLbitfield mask, GLenum filter
 ) {
-	GLchar msg[2048];
-	GLint compiled;
-	GLuint shader;
-	shader = renderer->glCreateShader(type);
-	renderer->glShaderSource(shader, 1, &shaderSrc, NULL);
-	renderer->glCompileShader(shader);
-	renderer->glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
-	if (!compiled) {
-		renderer->glGetShaderInfoLog(shader, sizeof(msg), NULL, msg);
-		FNA3D_LogError("Error compiling shader:\n%s\n", msg);
-		return 0;
-	}
+	OpenGLRenderer *renderer = (OpenGLRenderer*) driverData;
 
-	return shader;
+	/*
+	 * If we have glBlitFramebuffer, we can just use it, otherwise
+	 * we are forced to do this whole song and dance to emulate the
+	 * behavior.
+	 */
+	if (renderer->supports_EXT_framebuffer_blit)
+	{
+		renderer->glBlitFramebuffer(
+			srcX0, srcY0, srcX1, srcY1,
+			dstX0, dstY0, dstX1, dstY1,
+			mask, filter
+		);
+	}
+	else
+	{
+		float sx0, sx1, sy0, sy1;
+		float dx0, dx1, dy0, dy1; 
+
+		/* Begin the renderpass */
+		OPENGL_BeginPassRestore(
+			driverData,
+			renderer->fauxBackbufferResources.effect,
+			&renderer->fauxBackbufferResources.stateChanges
+		);
+		
+		/* Setup faux backbuffer texture */
+		renderer->glActiveTexture(GL_TEXTURE0);
+		renderer->glBindTexture(GL_TEXTURE_2D, renderer->backbuffer->opengl.texture);
+		if (renderer->backbuffer->opengl.filter != filter)
+		{
+			renderer->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+			renderer->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+			renderer->backbuffer->opengl.filter = filter;
+		}
+
+		/* Setup buffer data */
+		sx0 = (float)srcX0 / renderer->backbuffer->width;
+		sx1 = (float)srcX1 / renderer->backbuffer->width;
+		sy0 = (float)srcY0 / renderer->backbuffer->height;
+		sy1 = (float)srcY1 / renderer->backbuffer->height;
+
+		dx0 = ((float)dstX0 / drawW) * 2.0f - 1.0f;
+		dx1 = ((float)dstX1 / drawW) * 2.0f - 1.0f;
+		dy0 = ((float)dstY0 / drawH) * 2.0f - 1.0f;
+		dy1 = ((float)dstY1 / drawH) * 2.0f - 1.0f;
+
+		GLfloat blitFauxBackbuffer_vert[] = {
+			dx0, dy0, sx0, sy0,
+			dx0, dy1, sx0, sy1,
+			dx1, dy0, sx1, sy0,
+			dx1, dy1, sx1, sy1
+		};
+
+		OPENGL_SetVertexBufferData(
+			(FNA3D_Renderer *)renderer,
+			renderer->fauxBackbufferResources.vertBuffer,
+			0,
+			blitFauxBackbuffer_vert,
+			sizeof(blitFauxBackbuffer_vert),
+			1,
+			1,
+			FNA3D_SETDATAOPTIONS_NONE
+		);
+
+		OPENGL_ApplyVertexBufferBindings(driverData, &renderer->fauxBackbufferResources.bindings, 1, 0, 0);
+		OPENGL_DrawPrimitives(driverData, FNA3D_PRIMITIVETYPE_TRIANGLESTRIP, 0, 2);
+		OPENGL_EndPassRestore(driverData, renderer->fauxBackbufferResources.effect);
+		renderer->glBindTexture(renderer->textures[0]->target, renderer->textures[0]->handle);
+	}
 }
 
 FNA3D_Device* OPENGL_CreateDevice(
@@ -6277,44 +6299,6 @@ FNA3D_Device* OPENGL_CreateDevice(
 	/* Initialize the faux backbuffer */
 	OPENGL_INTERNAL_CreateBackbuffer(renderer, presentationParameters);
 
-	/* If we're emulating the BlitBuffer we need some resources. */
-	if (!renderer->supports_EXT_framebuffer_blit)
-	{
-		GLchar msg[2048];
-		GLint progStatus;
-		GLuint vertexPosAttr, textureUniform;
-		GLuint vertShader = LoadShader(renderer, GL_VERTEX_SHADER, OPENGL_QUAD_VS);
-		GLuint fragShader = LoadShader(renderer, GL_FRAGMENT_SHADER, OPENGL_QUAD_FS);
-		renderer->blitBufferProg = renderer->glCreateProgram();
-		renderer->glAttachShader(renderer->blitBufferProg, vertShader);
-		renderer->glAttachShader(renderer->blitBufferProg, fragShader);
-		renderer->glLinkProgram(renderer->blitBufferProg);
-
-		renderer->glGetProgramiv(renderer->blitBufferProg, GL_LINK_STATUS, &progStatus);
-		if (!progStatus)
-		{
-			renderer->glGetProgramInfoLog(renderer->blitBufferProg, sizeof(msg), NULL, msg);
-			FNA3D_LogError("Error linking program:\n%s\n", msg);
-		}
-
-		vertexPosAttr = renderer->glGetAttribLocation(renderer->blitBufferProg, "a_position");
-		textureUniform = renderer->glGetUniformLocation(renderer->blitBufferProg, "s_texture");
-
-		renderer->glUseProgram(renderer->blitBufferProg);
-		renderer->glGenVertexArrays(1, &renderer->blitBufferVAO);
-		renderer->glGenBuffers(1, &renderer->blitBufferVBO);
-
-		renderer->glBindVertexArray(renderer->blitBufferVAO);
-		renderer->glBindBuffer(GL_ARRAY_BUFFER, renderer->blitBufferVBO);
-		renderer->glEnableVertexAttribArray(vertexPosAttr);
-		renderer->glVertexAttribPointer(vertexPosAttr, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(GLfloat), (const void*)0);
-		renderer->glBufferData(GL_ARRAY_BUFFER, sizeof(OPENGL_QUAD_VERTS), OPENGL_QUAD_VERTS, GL_STATIC_DRAW);
-
-		renderer->glUniform1i(textureUniform, 0);
-		renderer->glBindVertexArray(renderer->vao);
-		renderer->glUseProgram(0);
-	}
-
 	/* Initialize texture collection array */
 	renderer->glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &numSamplers);
 	numSamplers = SDL_min(
@@ -6430,6 +6414,54 @@ FNA3D_Device* OPENGL_CreateDevice(
 	renderer->disposeIndexBuffersLock = SDL_CreateMutex();
 	renderer->disposeEffectsLock = SDL_CreateMutex();
 	renderer->disposeQueriesLock = SDL_CreateMutex();
+
+	/* We need to initialize some resources for faux-backbuffer emulation. */
+	if (!renderer->supports_EXT_framebuffer_blit)
+	{
+		OPENGL_CreateEffect(
+			(FNA3D_Renderer *)renderer,
+			blitFauxBackbuffer_fxb,
+			sizeof(blitFauxBackbuffer_fxb),
+			&renderer->fauxBackbufferResources.effect,
+			&renderer->fauxBackbufferResources.effectData
+		);
+
+		/* Allocate the vertex buffer. */
+		renderer->fauxBackbufferResources.vertBuffer = OPENGL_GenVertexBuffer(
+			(FNA3D_Renderer *)renderer,
+			0,
+			FNA3D_BUFFERUSAGE_NONE,
+			(2 + 2) * 4 * sizeof(GLfloat)
+		);
+
+		/* Setup the vertex buffer bindings. */
+		FNA3D_VertexBufferBinding *bindings = &renderer->fauxBackbufferResources.bindings;
+		*bindings = (FNA3D_VertexBufferBinding) {
+			.vertexBuffer = renderer->fauxBackbufferResources.vertBuffer,
+			.vertexDeclaration = (FNA3D_VertexDeclaration) {
+				.vertexStride = 4 * sizeof(GLfloat),
+				.elementCount = 2,
+				.elements = calloc(2, sizeof(FNA3D_VertexElement))
+			},
+			.vertexOffset = 0,
+			.instanceFrequency = 0
+		};
+
+		FNA3D_VertexElement *elements = bindings->vertexDeclaration.elements;
+		elements[0] = (FNA3D_VertexElement) {
+			.offset = 0 * sizeof(GLfloat),
+			.vertexElementFormat = FNA3D_VERTEXELEMENTFORMAT_VECTOR2,
+			.vertexElementUsage = FNA3D_VERTEXELEMENTUSAGE_POSITION,
+			.usageIndex = 0
+		};
+		
+		elements[1] = (FNA3D_VertexElement) {
+			.offset = 2 * sizeof(GLfloat),
+			.vertexElementFormat = FNA3D_VERTEXELEMENTFORMAT_VECTOR2,
+			.vertexElementUsage = FNA3D_VERTEXELEMENTUSAGE_TEXTURECOORDINATE,
+			.usageIndex = 0
+		};
+	}
 
 	/* Return the FNA3D_Device */
 	return result;
