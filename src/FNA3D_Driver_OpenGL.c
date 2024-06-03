@@ -1645,6 +1645,45 @@ static void OPENGL_Clear(
 	}
 }
 
+static void DrawRangeElementsBaseVertex(
+	OpenGLRenderer *renderer,
+	GLenum mode,
+	GLuint start,
+	GLuint end,
+	GLsizei count,
+	GLenum type,
+	void *indices,
+	GLint basevertex
+)
+{
+	/* GL 3.2 or supports_ARB_draw_elements_base_vertex */
+	if (renderer->supports_ARB_draw_elements_base_vertex)
+	{
+		renderer->glDrawRangeElementsBaseVertex(
+			mode,
+			start, end, count,
+			type,
+			indices,
+			basevertex
+		);
+	}
+	/* GLES 3.0 or GL 2.0 */
+	else if (renderer->supports_NonES2)
+	{
+		renderer->glDrawRangeElements(
+			mode,
+			start, end, count,
+			type,
+			indices
+		);
+	}
+	/* GLES 2.0 */
+	else
+	{
+		renderer->glDrawElements(mode, count, type, indices);
+	}
+}
+
 static void OPENGL_DrawIndexedPrimitives(
 	FNA3D_Renderer *driverData,
 	FNA3D_PrimitiveType primitiveType,
@@ -1671,9 +1710,8 @@ static void OPENGL_DrawIndexedPrimitives(
 	}
 
 	/* Draw! */
-	if (renderer->supports_ARB_draw_elements_base_vertex)
-	{
-		renderer->glDrawRangeElementsBaseVertex(
+	DrawRangeElementsBaseVertex(
+		renderer,
 			XNAToGL_Primitive[primitiveType],
 			minVertexIndex,
 			minVertexIndex + numVertices - 1,
@@ -1682,27 +1720,6 @@ static void OPENGL_DrawIndexedPrimitives(
 			(void*) (size_t) (startIndex * IndexSize(indexElementSize)),
 			baseVertex
 		);
-	}
-	else if (renderer->supports_NonES2)
-	{
-		renderer->glDrawRangeElements(
-			XNAToGL_Primitive[primitiveType],
-			minVertexIndex,
-			minVertexIndex + numVertices - 1,
-			PrimitiveVerts(primitiveType, primitiveCount),
-			XNAToGL_IndexType[indexElementSize],
-			(void*) (size_t) (startIndex * IndexSize(indexElementSize))
-		);
-	}
-	else
-	{
-		renderer->glDrawElements(
-			XNAToGL_Primitive[primitiveType],
-			PrimitiveVerts(primitiveType, primitiveCount),
-			XNAToGL_IndexType[indexElementSize],
-			(void*) (size_t) (startIndex * IndexSize(indexElementSize))
-		);
-	}
 
 	if (tps)
 	{
